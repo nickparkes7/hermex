@@ -715,11 +715,18 @@ enum MarkdownAttributedCodeFormatter {
 enum MarkdownContentFallbackReason: String, Equatable {
     case tooManyCharacters
     case tooManyLines
+    case tooManyInlineElements
 }
 
 enum MarkdownContentRenderingPolicy {
     static let maxMarkdownCharacterCount = 80_000
     static let maxMarkdownLineCount = 2_000
+    /// MarkdownUI joins a paragraph's inline elements (spans, emphasis, links,
+    /// soft breaks) into one `Text` with `+`, and SwiftUI resolves that chain
+    /// recursively on the main thread. A few thousand elements in one paragraph
+    /// overflow the stack and crash the app. Measured on iOS 26: 3,000 code spans
+    /// (about 6,000 elements) crash and 1,500 do not. This stays well below that.
+    static let maxInlineElementsPerBlock = 2_000
 
     static func fallbackReason(for content: String) -> MarkdownContentFallbackReason? {
         if content.count > maxMarkdownCharacterCount {
@@ -730,7 +737,57 @@ enum MarkdownContentRenderingPolicy {
             return .tooManyLines
         }
 
+        if hasOverlongInlineRun(in: content) {
+            return .tooManyInlineElements
+        }
+
         return nil
+    }
+
+    /// True when one paragraph holds more than `maxInlineElementsPerBlock` inline
+    /// markers and soft breaks. It counts delimiter characters instead of parsing,
+    /// so it can overcount (underscores in identifiers) but never undercounts a
+    /// pathological paragraph. Fenced code is skipped, and a blank line, heading,
+    /// list item, quote, or table row starts a new count because each renders as
+    /// its own `Text`.
+    static func hasOverlongInlineRun(in content: String) -> Bool {
+        var inFence = false
+        var count = 0
+
+        for line in content.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline) {
+            let trimmed = line.drop(while: { $0 == " " || $0 == "\t" })
+
+            if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
+                inFence.toggle()
+                count = 0
+                continue
+            }
+            if inFence { continue }
+
+            if startsNewBlock(trimmed) { count = 0 }
+            count += 1
+            for character in trimmed where inlineMarkers.contains(character) {
+                count += 1
+            }
+            if count > maxInlineElementsPerBlock { return true }
+        }
+
+        return false
+    }
+
+    private static let inlineMarkers: Set<Character> = ["`", "*", "_", "~", "[", "<", "!"]
+
+    private static func startsNewBlock(_ line: Substring) -> Bool {
+        guard let first = line.first else { return true }
+        if first == "#" || first == ">" || first == "|" { return true }
+        if first == "-" || first == "+" || first == "*" {
+            return line.dropFirst().first == " "
+        }
+        if first.isNumber {
+            let rest = line.drop(while: \.isNumber)
+            return (rest.first == "." || rest.first == ")") && rest.dropFirst().first == " "
+        }
+        return false
     }
 }
 
@@ -1107,17 +1164,67 @@ private struct PlainMarkdownFallbackView: View {
     private let logger = Logger.hermesMarkdownRendering
 
     var body: some View {
-        Text(verbatim: content)
-            .responseSelectableText(content)
-            .font(.body)
-            .foregroundStyle(.primary)
-            .fixedSize(horizontal: false, vertical: true)
-            .responseTextSelectionPolicy()
-            .onAppear {
-                logger.info(
-                    "Markdown plain fallback reason=\(reason.rawValue, privacy: .public) characters=\(content.count, privacy: .public) lines=\(MarkdownHighlightPolicy.lineCount(in: content), privacy: .public)"
-                )
+        // One `Text` taller than about 16,000 pt does not draw at all, so the
+        // content is laid out as stacked pieces instead of a single `Text`.
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(PlainTextChunker.chunks(in: content)) { chunk in
+                Text(verbatim: chunk.text)
+                    .responseSelectableText(chunk.text, separator: chunk.separator)
             }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .font(.body)
+        .foregroundStyle(.primary)
+        .fixedSize(horizontal: false, vertical: true)
+        .responseTextSelectionPolicy()
+        .onAppear {
+            logger.info(
+                "Markdown plain fallback reason=\(reason.rawValue, privacy: .public) characters=\(content.count, privacy: .public) lines=\(MarkdownHighlightPolicy.lineCount(in: content), privacy: .public)"
+            )
+        }
+    }
+}
+
+/// Splits plain text into pieces short enough to draw as separate `Text` views,
+/// cutting at a line break when one is in range, then at a space.
+enum PlainTextChunker {
+    static let maxChunkLength = 2_000
+
+    struct Chunk: Identifiable, Equatable {
+        let id: Int
+        let text: String
+        /// What joins this chunk to the next when the text is copied.
+        let separator: String
+    }
+
+    static func chunks(in content: String, maxLength: Int = maxChunkLength) -> [Chunk] {
+        var chunks: [Chunk] = []
+        var start = content.startIndex
+
+        while start < content.endIndex {
+            let limit = content.index(start, offsetBy: maxLength, limitedBy: content.endIndex) ?? content.endIndex
+            var end = limit
+            if limit < content.endIndex {
+                let window = content[start..<limit]
+                if let cut = window.lastIndex(where: \.isNewline) ?? window.lastIndex(of: " "),
+                   cut > start {
+                    end = content.index(after: cut)
+                }
+            }
+
+            var piece = content[start..<end]
+            var separator = ""
+            if piece.last?.isNewline == true {
+                piece = piece.dropLast()
+                separator = "\n"
+            }
+            // An empty line still needs a row's height.
+            let text = piece.isEmpty ? " " : String(piece)
+            chunks.append(Chunk(id: chunks.count, text: text, separator: separator))
+            start = end
+        }
+
+        return chunks.isEmpty ? [Chunk(id: 0, text: " ", separator: "")] : chunks
     }
 }
 

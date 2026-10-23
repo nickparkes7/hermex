@@ -449,6 +449,59 @@ final class MarkdownMathRendererTests: XCTestCase {
             .tooManyLines
         )
     }
+
+    func testMarkdownContentRenderingPolicyFallsBackForOverlongInlineParagraph() {
+        let spans = (0..<3_000).map { "`span\($0)`" }.joined(separator: " ")
+
+        XCTAssertEqual(
+            MarkdownContentRenderingPolicy.fallbackReason(for: "Intro\n\n" + spans),
+            .tooManyInlineElements
+        )
+    }
+
+    func testMarkdownContentRenderingPolicyKeepsInlineHeavyContentThatRendersSafely() {
+        let spans = (0..<3_000).map { "`span\($0)`" }.joined(separator: " ")
+        let row = (0..<10).map { "`cell\($0)`" }.joined(separator: " | ")
+        let cases = [
+            "fenced code": "```\n" + spans + "\n```",
+            "list items": (0..<600).map { _ in "- `a` `b` `c` **d**" }.joined(separator: "\n"),
+            "table rows": (0..<150).map { _ in "| \(row) |" }.joined(separator: "\n"),
+            "paragraphs": (0..<600).map { _ in "`a` `b` `c` **d**" }.joined(separator: "\n\n"),
+        ]
+
+        for (name, content) in cases {
+            XCTAssertNil(MarkdownContentRenderingPolicy.fallbackReason(for: content), name)
+        }
+    }
+
+    func testPlainTextChunkerKeepsEveryCharacterInBoundedPieces() {
+        let content = (0..<400).map { "line \($0) " + String(repeating: "word ", count: $0 % 7 * 40) }
+            .joined(separator: "\n") + "\n\n" + String(repeating: "x", count: 5_000)
+
+        let chunks = PlainTextChunker.chunks(in: content, maxLength: 300)
+
+        XCTAssertTrue(chunks.allSatisfy { $0.text.count <= 300 })
+        XCTAssertEqual(chunks.map { $0.text + $0.separator }.joined(), content)
+    }
+
+    /// A paragraph with thousands of inline elements used to overflow the stack
+    /// while SwiftUI resolved MarkdownUI's chain of concatenated `Text` values,
+    /// crashing the app on launch whenever that chat was the one reopened.
+    @MainActor
+    func testOverlongInlineParagraphRendersWithoutOverflowingTheStack() async throws {
+        let content = (0..<3_000).map { "`span\($0)`" }.joined(separator: " ")
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        let host = UIHostingController(rootView: MarkdownRenderer(content: content))
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+
+        host.view.layoutIfNeeded()
+        let size = host.sizeThatFits(in: CGSize(width: 390, height: 100_000))
+
+        XCTAssertGreaterThan(size.height, 0)
+    }
 }
 
 private func foregroundColorSignatures(in attributedString: NSAttributedString, userInterfaceStyle: UIUserInterfaceStyle) -> Set<String> {

@@ -450,23 +450,13 @@ final class MarkdownMathRendererTests: XCTestCase {
         )
     }
 
-    func testMarkdownContentRenderingPolicyFallsBackForOverlongInlineParagraph() {
-        let spans = (0..<3_000).map { "`span\($0)`" }.joined(separator: " ")
-
-        XCTAssertEqual(
-            MarkdownContentRenderingPolicy.fallbackReason(for: "Intro\n\n" + spans),
-            .tooManyInlineElements
-        )
-    }
-
-    func testMarkdownContentRenderingPolicyKeepsInlineHeavyContentThatRendersSafely() {
-        let spans = (0..<3_000).map { "`span\($0)`" }.joined(separator: " ")
-        let row = (0..<10).map { "`cell\($0)`" }.joined(separator: " | ")
+    func testMarkdownContentRenderingPolicyKeepsInlineHeavyMarkdownSplitIntoParagraphs() {
+        let spans = (0..<400).map { "`span\($0)`" }.joined(separator: " ")
         let cases = [
-            "fenced code": "```\n" + spans + "\n```",
-            "list items": (0..<600).map { _ in "- `a` `b` `c` **d**" }.joined(separator: "\n"),
-            "table rows": (0..<150).map { _ in "| \(row) |" }.joined(separator: "\n"),
-            "paragraphs": (0..<600).map { _ in "`a` `b` `c` **d**" }.joined(separator: "\n\n"),
+            "fenced code": "```\n\(spans)\n```",
+            "list items": Array(repeating: "- `a` `b` **c** [d](https://e.invalid)", count: 300).joined(separator: "\n"),
+            "table rows": Array(repeating: "| `a` | `b` | `c` |", count: 300).joined(separator: "\n"),
+            "paragraphs": Array(repeating: "`a` `b` **c** [d](https://e.invalid)", count: 300).joined(separator: "\r\n\r\n"),
         ]
 
         for (name, content) in cases {
@@ -484,24 +474,49 @@ final class MarkdownMathRendererTests: XCTestCase {
         XCTAssertEqual(chunks.map { $0.text + $0.separator }.joined(), content)
     }
 
-    /// A paragraph with thousands of inline elements used to overflow the stack
+    /// A paragraph with a few hundred inline elements used to overflow the stack
     /// while SwiftUI resolved MarkdownUI's chain of concatenated `Text` values,
-    /// crashing the app on launch whenever that chat was the one reopened.
+    /// crashing the app on every launch once that chat was the one reopened (#1333).
     @MainActor
-    func testOverlongInlineParagraphRendersWithoutOverflowingTheStack() async throws {
-        let content = (0..<3_000).map { "`span\($0)`" }.joined(separator: " ")
+    func testOverlongParagraphsRenderOnAnIPhoneSizedStack() throws {
+        let contents = [
+            (0..<400).map { "`span\($0)`" }.joined(separator: " "),
+            (0..<400).map { "output line \($0)" }.joined(separator: "\n"),
+        ]
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
-        let window = UIWindow(windowScene: scene)
-        let host = UIHostingController(rootView: MarkdownRenderer(content: content))
-        window.rootViewController = host
-        window.makeKeyAndVisible()
-        defer { window.isHidden = true }
 
-        host.view.layoutIfNeeded()
-        let size = host.sizeThatFits(in: CGSize(width: 390, height: 100_000))
+        for content in contents {
+            let window = UIWindow(windowScene: scene)
+            let host = UIHostingController(rootView: MarkdownRenderer(content: content))
+            window.rootViewController = host
+            window.makeKeyAndVisible()
+            var size = CGSize.zero
+            withMainThreadStackLeft(1_008 * 1_024) {
+                host.view.layoutIfNeeded()
+                size = host.sizeThatFits(in: CGSize(width: 390, height: 100_000))
+            }
+            window.isHidden = true
 
-        XCTAssertGreaterThan(size.height, 0)
+            XCTAssertGreaterThan(size.height, 0)
+        }
     }
+}
+
+/// Runs `body` with about `bytes` of stack left, the size of an iPhone's main
+/// thread stack. The simulator's main thread has 8 MB, enough to hide an overflow.
+private func withMainThreadStackLeft(_ bytes: Int, _ body: () -> Void) {
+    let top = UInt(bitPattern: pthread_get_stackaddr_np(pthread_self()))
+    let size = pthread_get_stacksize_np(pthread_self())
+    func descend(_ depth: Int) {
+        var local = depth
+        let address = withUnsafeMutablePointer(to: &local) { UInt(bitPattern: $0) }
+        if Int(top - address) >= size - bytes {
+            body()
+        } else {
+            descend(local + 1)
+        }
+    }
+    descend(0)
 }
 
 private func foregroundColorSignatures(in attributedString: NSAttributedString, userInterfaceStyle: UIUserInterfaceStyle) -> Set<String> {

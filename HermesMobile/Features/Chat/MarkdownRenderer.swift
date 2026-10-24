@@ -199,7 +199,8 @@ private struct ChatMarkdownView: View {
         performanceSignposter.endInterval("Markdown Parse", signpost, "chars=\(content.count, privacy: .public)")
 
         return Markdown(parsedContent)
-            .environment(\.containsInlineMath, content.contains(InlineMathSource.marker))
+            .environment(\.containsInlineMath, content.contains(InlineMathSource.marker)
+                || MarkdownContentRenderingPolicy.hasTooManyInlineElements(content))
             .markdownTheme(MarkdownUI.Theme.chat(colorScheme: colorScheme, isStreaming: isStreaming))
             .markdownTextStyle {
                 ForegroundColor(.primary)
@@ -715,16 +716,14 @@ enum MarkdownAttributedCodeFormatter {
 enum MarkdownContentFallbackReason: String, Equatable {
     case tooManyCharacters
     case tooManyLines
-    case tooManyInlineElements
 }
 
 enum MarkdownContentRenderingPolicy {
     static let maxMarkdownCharacterCount = 80_000
     static let maxMarkdownLineCount = 2_000
-    /// MarkdownUI builds a paragraph's `Text` by appending its inline elements
-    /// (text runs, code spans, emphasis, links, soft breaks) one at a time with
-    /// `+`, and SwiftUI resolves that chain recursively. On an iPhone's 1 MB main
-    /// thread stack, about 600 elements in one paragraph overflow it (#1333).
+    /// MarkdownUI joins a paragraph's inline elements with `Text` `+`, which
+    /// SwiftUI resolves recursively; about 600 overflow an iPhone's 1 MB main
+    /// thread stack (#1333). Paragraphs over this limit render as one `Text`.
     static let maxInlineElementsPerParagraph = 300
 
     static func fallbackReason(for content: String) -> MarkdownContentFallbackReason? {
@@ -736,64 +735,24 @@ enum MarkdownContentRenderingPolicy {
             return .tooManyLines
         }
 
-        if hasOverlongParagraph(in: content) {
-            return .tooManyInlineElements
-        }
-
         return nil
     }
 
-    /// Overestimates each paragraph's inline elements: every markdown delimiter
-    /// counts once and every line twice (its text and the soft break before it).
-    /// Fenced code is skipped; a blank line, heading, table row, or list item
-    /// starts a new paragraph.
-    static func hasOverlongParagraph(in content: String) -> Bool {
+    /// Overestimates inline elements: each delimiter counts once, each line twice.
+    static func hasTooManyInlineElements(_ markdown: String) -> Bool {
         var count = 0
-        var inFence = false
-
-        for line in content.utf8.split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: false) {
-            var text = line.drop { $0 == UInt8(ascii: " ") || $0 == UInt8(ascii: "\t") }
-            if text.last == UInt8(ascii: "\r") { text = text.dropLast() }
-
-            if text.starts(with: "```".utf8) || text.starts(with: "~~~".utf8) {
-                inFence.toggle()
-                count = 0
-                continue
-            }
-            if inFence { continue }
-
-            if startsParagraph(text) { count = 0 }
-            count += 2
-            for byte in text {
-                if byte == UInt8(ascii: "\r") {
-                    count += 2
-                } else if inlineDelimiters.contains(byte) {
-                    count += 1
-                }
+        for byte in markdown.utf8 {
+            if byte == UInt8(ascii: "\n") || byte == UInt8(ascii: "\r") {
+                count += 2
+            } else if inlineDelimiters.contains(byte) {
+                count += 1
             }
             if count > maxInlineElementsPerParagraph { return true }
         }
-
         return false
     }
 
     private static let inlineDelimiters = Set("`*_~[]<>!$\\".utf8)
-
-    private static func startsParagraph(_ line: Substring.UTF8View.SubSequence) -> Bool {
-        guard let first = line.first else { return true }
-        switch first {
-        case UInt8(ascii: "#"), UInt8(ascii: "|"):
-            return true
-        case UInt8(ascii: "-"), UInt8(ascii: "+"), UInt8(ascii: "*"):
-            return line.dropFirst().first == UInt8(ascii: " ")
-        case UInt8(ascii: "0")...UInt8(ascii: "9"):
-            let rest = line.drop { (UInt8(ascii: "0")...UInt8(ascii: "9")).contains($0) }
-            return (rest.first == UInt8(ascii: ".") || rest.first == UInt8(ascii: ")"))
-                && rest.dropFirst().first == UInt8(ascii: " ")
-        default:
-            return false
-        }
-    }
 }
 
 enum MarkdownHighlightEngine: Equatable {
@@ -1169,67 +1128,17 @@ private struct PlainMarkdownFallbackView: View {
     private let logger = Logger.hermesMarkdownRendering
 
     var body: some View {
-        // A single `Text` a few thousand points tall draws nothing (an 11,000
-        // character fallback rendered blank), so the content is stacked in pieces.
-        VStack(alignment: .leading, spacing: 0) {
-            ForEach(PlainTextChunker.chunks(in: content)) { chunk in
-                Text(verbatim: chunk.text)
-                    .responseSelectableText(chunk.text, separator: chunk.separator)
+        Text(verbatim: content)
+            .responseSelectableText(content)
+            .font(.body)
+            .foregroundStyle(.primary)
+            .fixedSize(horizontal: false, vertical: true)
+            .responseTextSelectionPolicy()
+            .onAppear {
+                logger.info(
+                    "Markdown plain fallback reason=\(reason.rawValue, privacy: .public) characters=\(content.count, privacy: .public) lines=\(MarkdownHighlightPolicy.lineCount(in: content), privacy: .public)"
+                )
             }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .font(.body)
-        .foregroundStyle(.primary)
-        .fixedSize(horizontal: false, vertical: true)
-        .responseTextSelectionPolicy()
-        .onAppear {
-            logger.info(
-                "Markdown plain fallback reason=\(reason.rawValue, privacy: .public) characters=\(content.count, privacy: .public) lines=\(MarkdownHighlightPolicy.lineCount(in: content), privacy: .public)"
-            )
-        }
-    }
-}
-
-/// Splits plain text into pieces short enough to draw as separate `Text` views,
-/// cutting at a line break when one is in range, then at a space.
-enum PlainTextChunker {
-    static let maxChunkLength = 2_000
-
-    struct Chunk: Identifiable {
-        let id: Int
-        let text: String
-        /// What joins this chunk to the next when the text is copied.
-        let separator: String
-    }
-
-    static func chunks(in content: String, maxLength: Int = maxChunkLength) -> [Chunk] {
-        var chunks: [Chunk] = []
-        var start = content.startIndex
-
-        while start < content.endIndex {
-            let limit = content.index(start, offsetBy: maxLength, limitedBy: content.endIndex) ?? content.endIndex
-            var end = limit
-            if limit < content.endIndex {
-                let window = content[start..<limit]
-                if let cut = window.lastIndex(where: \.isNewline) ?? window.lastIndex(of: " "),
-                   cut > start {
-                    end = content.index(after: cut)
-                }
-            }
-
-            var piece = content[start..<end]
-            var separator = ""
-            if piece.last?.isNewline == true {
-                piece = piece.dropLast()
-                separator = "\n"
-            }
-            // An empty line still needs a row's height.
-            let text = piece.isEmpty ? " " : String(piece)
-            chunks.append(Chunk(id: chunks.count, text: text, separator: separator))
-            start = end
-        }
-
-        return chunks
     }
 }
 

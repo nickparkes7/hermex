@@ -864,6 +864,10 @@ final class InlineElementStackDepthTests: XCTestCase {
         renderWithPhoneStack((0..<400).map { "https://example.com/p/\($0)" }.joined(separator: " "))
     }
 
+    func testSchemelessWWWLinkParagraphRendersOnAPhoneStack() {
+        renderWithPhoneStack((0..<400).map { "www.example.com/p/\($0)" }.joined(separator: " "))
+    }
+
     private func renderWithPhoneStack(_ markdown: String) {
         let host = UIHostingController(rootView: ScrollView { MarkdownRenderer(content: markdown) })
         let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 900))

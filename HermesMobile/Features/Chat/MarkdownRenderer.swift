@@ -739,17 +739,21 @@ enum MarkdownContentRenderingPolicy {
     }
 
     /// Overestimates inline elements: each delimiter counts once; each line, and
-    /// each `:` or `@` of a bare URL or email that GFM autolinks, counts twice.
+    /// each `:`, `@` or `www.` of a bare URL or email that GFM autolinks, counts twice.
     static func hasTooManyInlineElements(_ markdown: String) -> Bool {
         var count = 0
+        var trailingWs = 0
         for byte in markdown.utf8 {
             if byte == UInt8(ascii: "\n") || byte == UInt8(ascii: "\r") {
                 count += 2
             } else if byte == UInt8(ascii: ":") || byte == UInt8(ascii: "@") {
                 count += 2
+            } else if byte == UInt8(ascii: "."), trailingWs >= 3 {
+                count += 2
             } else if inlineDelimiters.contains(byte) {
                 count += 1
             }
+            trailingWs = byte == UInt8(ascii: "w") ? trailingWs + 1 : 0
             if count > maxInlineElementsPerParagraph { return true }
         }
         return false
